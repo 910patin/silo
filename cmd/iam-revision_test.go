@@ -14,7 +14,9 @@ import (
 	"time"
 
 	"github.com/minio/madmin-go/v3"
+	"github.com/minio/minio/internal/auth"
 	"github.com/minio/minio/internal/grid"
+	"github.com/pgsty/silo-pkg/v3/ldap"
 	xnet "github.com/pgsty/silo-pkg/v3/net"
 )
 
@@ -90,6 +92,93 @@ func TestIAMRevocationTombstoneReplayIsIdempotent(t *testing.T) {
 				t.Fatalf("newer recreation rejected: %v", err)
 			}
 		})
+	}
+}
+
+// An LDAP parent named by a normalized DN longer than NAME_MAX has no record
+// on object storage. Its lookups must find nothing instead of failing login.
+func TestLoadIAMRevisionNameTooLong(t *testing.T) {
+	for _, backend := range []string{"object", "etcd"} {
+		t.Run(backend, func(t *testing.T) {
+			ctx, sys, _ := prepareIAMRevisionFixture(t, backend)
+			store := sys.store.IAMStorageAPI
+			// 160 bytes of UTF-8 become 384 characters.
+			parent, err := ldap.NormalizeDN("uid=Сотрудник,ou=Отдел разработки,ou=Дирекция информационных технологий,ou=people,ou=swengg,dc=min,dc=io")
+			mustIAM(t, err)
+			if len(parent) <= 255 {
+				t.Fatalf("normalized DN has only %d characters", len(parent))
+			}
+			parentPath := getUserIdentityPath(parent, regUser)
+			for _, path := range []string{parentPath, getUserIdentityPath("missing-parent", regUser)} {
+				r, err := loadIAMRevision(ctx, store, path)
+				if err != nil || r.Deleted || !r.timestamp().IsZero() || !r.RevokedBefore.IsZero() {
+					t.Fatalf("absent revision %.40s...: %+v, %v", path, r, err)
+				}
+			}
+			if backend == "object" {
+				var invalid ObjectNameInvalid
+				if _, err := loadIAMRevision(ctx, store, iamConfigUsersPrefix+"a//b/"+iamIdentityFile); !errors.As(err, &invalid) {
+					t.Fatalf("invalid name not caused by length was masked: %v", err)
+				}
+			}
+
+			claims := map[string]any{}
+			mustIAM(t, setIAMParentRevocationClaim(ctx, store, parent, claims))
+			if _, ok := claims[iamParentRevocationClaim]; ok {
+				t.Fatalf("unexpected revocation claim: %v", claims)
+			}
+			if _, err := sys.PolicyDBGet(parent); err != nil {
+				t.Fatalf("policy lookup failed: %v", err)
+			}
+			// The call that failed in AssumeRoleWithLDAPIdentity.
+			secret, err := getTokenSigningKey()
+			mustIAM(t, err)
+			cred, err := auth.GetNewCredentialsWithMetadata(map[string]any{"exp": UTCNow().Add(time.Hour).Unix(), parentClaim: parent}, secret)
+			mustIAM(t, err)
+			cred.ParentUser = parent
+			_, err = sys.SetTempUser(ctx, cred.AccessKey, cred, "")
+			mustIAM(t, err)
+			if _, ok := sys.store.GetUser(cred.AccessKey); !ok {
+				t.Fatal("temporary credential not cached")
+			}
+
+			// Object storage still cannot record a revocation for this parent;
+			// the failure must be reported. Etcd has no such limit.
+			err = saveIAMRevision(ctx, store, parentPath, &iamUserRevocation{})
+			if backend == "object" {
+				if !iamConfigNameTooLong(parentPath, err) {
+					t.Fatalf("expected name-too-long error, got %v", err)
+				}
+				return
+			}
+			mustIAM(t, err)
+			if err := checkIAMParentRevision(ctx, store, cred); !errors.Is(err, errIAMStaleUpdate) {
+				t.Fatalf("revoked parent accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestIAMConfigNameTooLong(t *testing.T) {
+	long := iamConfigUsersPrefix + strings.Repeat("x", 256) + "/" + iamIdentityFile
+	short := iamConfigUsersPrefix + strings.Repeat("x", 255) + "/" + iamIdentityFile
+	for _, tc := range []struct {
+		name string
+		path string
+		err  error
+		want bool
+	}{
+		{"object layer", long, ObjectNameInvalid{Bucket: minioMetaBucket, Object: long}, true},
+		{"drive", long, errFileNameTooLong, true},
+		{"no error", long, nil, false},
+		{"not found", long, errConfigNotFound, false},
+		{"offline drive", long, errDiskNotFound, false},
+		{"read quorum", long, InsufficientReadQuorum{}, false},
+		{"other invalid name", short, ObjectNameInvalid{Bucket: minioMetaBucket, Object: short}, false},
+	} {
+		if got := iamConfigNameTooLong(tc.path, tc.err); got != tc.want {
+			t.Errorf("%s: got %t, want %t", tc.name, got, tc.want)
+		}
 	}
 }
 
