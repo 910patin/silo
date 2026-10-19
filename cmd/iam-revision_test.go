@@ -7,9 +7,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
 	"os"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -159,22 +161,87 @@ func TestLoadIAMRevisionNameTooLong(t *testing.T) {
 	}
 }
 
+// A filesystem whose name limit is below NAME_MAX (eCryptfs allows 143) fails
+// on the drive with ENAMETOOLONG, which checkPathLength does not anticipate.
+type iamNameLimitObjectLayer struct {
+	ObjectLayer
+	limit int
+}
+
+func (o iamNameLimitObjectLayer) check(bucket, object string) error {
+	for _, elem := range strings.Split(object, SlashSeparator) {
+		if len(elem) > o.limit {
+			return toObjectErr(&os.PathError{Op: "open", Path: object, Err: syscall.ENAMETOOLONG}, bucket, object)
+		}
+	}
+	return nil
+}
+
+func (o iamNameLimitObjectLayer) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, opts ObjectOptions) (*GetObjectReader, error) {
+	if err := o.check(bucket, object); err != nil {
+		return nil, err
+	}
+	return o.ObjectLayer.GetObjectNInfo(ctx, bucket, object, rs, h, opts)
+}
+
+func (o iamNameLimitObjectLayer) PutObject(ctx context.Context, bucket, object string, data *PutObjReader, opts ObjectOptions) (ObjectInfo, error) {
+	if err := o.check(bucket, object); err != nil {
+		return ObjectInfo{}, err
+	}
+	return o.ObjectLayer.PutObject(ctx, bucket, object, data, opts)
+}
+
+func TestLoadIAMRevisionFilesystemNameLimit(t *testing.T) {
+	ctx, _, obj := prepareIAMRevisionFixture(t)
+	const limit = 143
+	parent, err := ldap.NormalizeDN("uid=Сотрудник,ou=Отдел разработки,ou=people,ou=swengg,dc=min,dc=io")
+	mustIAM(t, err)
+	if len(parent) <= limit || len(parent) > 255 {
+		t.Fatalf("normalized DN must exceed only the filesystem limit, got %d characters", len(parent))
+	}
+	store := &IAMStoreSys{IAMStorageAPI: newIAMObjectStore(iamNameLimitObjectLayer{obj, limit}, LDAPUsersSysType)}
+	mustIAM(t, store.LoadIAMCache(ctx, false))
+	parentPath := getUserIdentityPath(parent, regUser)
+	r, err := loadIAMRevision(ctx, store.IAMStorageAPI, parentPath)
+	if err != nil || r.Deleted || !r.timestamp().IsZero() {
+		t.Fatalf("absent revision: %+v, %v", r, err)
+	}
+	// LDAP mode reads policydb/sts-users/<DN>.json.
+	if _, err := store.PolicyDBGet(parent); err != nil {
+		t.Fatalf("policy lookup failed: %v", err)
+	}
+	secret, err := getTokenSigningKey()
+	mustIAM(t, err)
+	cred, err := auth.GetNewCredentialsWithMetadata(map[string]any{"exp": UTCNow().Add(time.Hour).Unix(), parentClaim: parent}, secret)
+	mustIAM(t, err)
+	cred.ParentUser = parent
+	if _, err := store.SetTempUser(ctx, cred.AccessKey, cred, ""); err != nil {
+		t.Fatalf("temporary credential rejected: %v", err)
+	}
+	err = saveIAMRevision(ctx, store.IAMStorageAPI, parentPath, &iamUserRevocation{})
+	if !iamConfigNameTooLong(parentPath, err) {
+		t.Fatalf("expected name-too-long error, got %v", err)
+	}
+}
+
 func TestIAMConfigNameTooLong(t *testing.T) {
 	long := iamConfigUsersPrefix + strings.Repeat("x", 256) + "/" + iamIdentityFile
-	short := iamConfigUsersPrefix + strings.Repeat("x", 255) + "/" + iamIdentityFile
+	short := iamConfigUsersPrefix + strings.Repeat("x", 200) + "/" + iamIdentityFile
+	invalid := iamConfigUsersPrefix + "a//b/" + iamIdentityFile
 	for _, tc := range []struct {
 		name string
 		path string
 		err  error
 		want bool
 	}{
-		{"object layer", long, ObjectNameInvalid{Bucket: minioMetaBucket, Object: long}, true},
+		{"NAME_MAX", long, ObjectNameInvalid{Bucket: minioMetaBucket, Object: long}, true},
+		{"filesystem limit", short, ObjectNameInvalid{Bucket: minioMetaBucket, Object: short}, true},
 		{"drive", long, errFileNameTooLong, true},
 		{"no error", long, nil, false},
 		{"not found", long, errConfigNotFound, false},
 		{"offline drive", long, errDiskNotFound, false},
 		{"read quorum", long, InsufficientReadQuorum{}, false},
-		{"other invalid name", short, ObjectNameInvalid{Bucket: minioMetaBucket, Object: short}, false},
+		{"invalid name", invalid, ObjectNameInvalid{Bucket: minioMetaBucket, Object: invalid}, false},
 	} {
 		if got := iamConfigNameTooLong(tc.path, tc.err); got != tc.want {
 			t.Errorf("%s: got %t, want %t", tc.name, got, tc.want)

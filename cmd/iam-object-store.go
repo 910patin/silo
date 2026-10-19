@@ -134,18 +134,19 @@ func decryptData(data []byte, objPath string) ([]byte, error) {
 	return nil, err
 }
 
-// iamConfigNameTooLong reports whether the object layer rejected objPath for
-// its length. The drive path only adds to objPath, so this holds on every
-// drive; on Unix it means that an element exceeds NAME_MAX (255). IAM records
-// are named after external identities: a normalized LDAP DN hex-escapes every
-// non-ASCII byte, so one Cyrillic letter takes six characters. Such a record
-// can never have been stored. Other invalid names are still reported.
+// iamConfigNameTooLong reports whether the drives rejected objPath for its
+// length: an element over NAME_MAX (255) in checkPathLength, or ENAMETOOLONG
+// from a filesystem with a lower limit. IAM records are named after external
+// identities: a normalized LDAP DN hex-escapes every non-ASCII byte, so one
+// Cyrillic letter takes six characters. Such a record cannot have been stored.
+// toObjectErr reports both as ObjectNameInvalid, as it does for names that the
+// object layer rejects itself; repeat that validation to tell them apart.
 func iamConfigNameTooLong(objPath string, err error) bool {
-	var invalid ObjectNameInvalid
-	if !errors.Is(err, errFileNameTooLong) && !errors.As(err, &invalid) {
-		return false
+	if errors.Is(err, errFileNameTooLong) {
+		return true
 	}
-	return errors.Is(checkPathLength(objPath), errFileNameTooLong)
+	var invalid ObjectNameInvalid
+	return errors.As(err, &invalid) && checkBucketAndObjectNames(context.Background(), minioMetaBucket, objPath) == nil
 }
 
 func (iamOS *IAMObjectStore) loadIAMConfigBytesWithMetadata(ctx context.Context, objPath string) ([]byte, ObjectInfo, error) {
