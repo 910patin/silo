@@ -7,11 +7,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"net/http"
 	"os"
 	"strings"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
@@ -161,47 +159,22 @@ func TestLoadIAMRevisionNameTooLong(t *testing.T) {
 	}
 }
 
-// A filesystem whose name limit is below NAME_MAX (eCryptfs allows 143) fails
-// on the drive with ENAMETOOLONG, which checkPathLength does not anticipate.
-type iamNameLimitObjectLayer struct {
-	ObjectLayer
-	limit int
-}
-
-func (o iamNameLimitObjectLayer) check(bucket, object string) error {
-	for _, elem := range strings.Split(object, SlashSeparator) {
-		if len(elem) > o.limit {
-			return toObjectErr(&os.PathError{Op: "open", Path: object, Err: syscall.ENAMETOOLONG}, bucket, object)
-		}
-	}
-	return nil
-}
-
-func (o iamNameLimitObjectLayer) GetObjectNInfo(ctx context.Context, bucket, object string, rs *HTTPRangeSpec, h http.Header, opts ObjectOptions) (*GetObjectReader, error) {
-	if err := o.check(bucket, object); err != nil {
-		return nil, err
-	}
-	return o.ObjectLayer.GetObjectNInfo(ctx, bucket, object, rs, h, opts)
-}
-
-func (o iamNameLimitObjectLayer) PutObject(ctx context.Context, bucket, object string, data *PutObjReader, opts ObjectOptions) (ObjectInfo, error) {
-	if err := o.check(bucket, object); err != nil {
-		return ObjectInfo{}, err
-	}
-	return o.ObjectLayer.PutObject(ctx, bucket, object, data, opts)
-}
-
-func TestLoadIAMRevisionFilesystemNameLimit(t *testing.T) {
-	ctx, _, obj := prepareIAMRevisionFixture(t)
-	const limit = 143
-	parent, err := ldap.NormalizeDN("uid=Сотрудник,ou=Отдел разработки,ou=people,ou=swengg,dc=min,dc=io")
+// checkPathLength does not count backslashes outside Windows, so this escaped
+// DN passes it. Once config/iam/users exists, as after creating any built-in
+// user, the filesystem rejects the element with ENAMETOOLONG instead.
+func TestLoadIAMRevisionFilesystemNameTooLong(t *testing.T) {
+	ctx, sys, obj := prepareIAMRevisionFixture(t)
+	parent, err := ldap.NormalizeDN("cn=Сидоров П.П.,ou=Отдел ИТ-поддержки,ou=Пользователи,ou=people,ou=swengg,dc=min,dc=io")
 	mustIAM(t, err)
-	if len(parent) <= limit || len(parent) > 255 {
-		t.Fatalf("normalized DN must exceed only the filesystem limit, got %d characters", len(parent))
-	}
-	store := &IAMStoreSys{IAMStorageAPI: newIAMObjectStore(iamNameLimitObjectLayer{obj, limit}, LDAPUsersSysType)}
-	mustIAM(t, store.LoadIAMCache(ctx, false))
 	parentPath := getUserIdentityPath(parent, regUser)
+	if len(parent) <= 255 || checkPathLength(parentPath) != nil {
+		t.Fatalf("normalized DN must exceed NAME_MAX yet pass checkPathLength: %d characters, %v", len(parent), checkPathLength(parentPath))
+	}
+	_, err = sys.CreateUser(ctx, "existing-user", madmin.AddOrUpdateUserReq{SecretKey: "synthetic-user-password", Status: madmin.AccountEnabled})
+	mustIAM(t, err)
+	mustIAM(t, saveIAMRevision(ctx, sys.store.IAMStorageAPI, getMappedPolicyPath("existing-parent", stsUser, false), &MappedPolicy{Version: 1, Policies: "readwrite"}))
+	store := &IAMStoreSys{IAMStorageAPI: newIAMObjectStore(obj, LDAPUsersSysType)}
+	mustIAM(t, store.LoadIAMCache(ctx, false))
 	r, err := loadIAMRevision(ctx, store.IAMStorageAPI, parentPath)
 	if err != nil || r.Deleted || !r.timestamp().IsZero() {
 		t.Fatalf("absent revision: %+v, %v", r, err)
@@ -235,7 +208,7 @@ func TestIAMConfigNameTooLong(t *testing.T) {
 		want bool
 	}{
 		{"NAME_MAX", long, ObjectNameInvalid{Bucket: minioMetaBucket, Object: long}, true},
-		{"filesystem limit", short, ObjectNameInvalid{Bucket: minioMetaBucket, Object: short}, true},
+		{"filesystem", short, ObjectNameInvalid{Bucket: minioMetaBucket, Object: short}, true},
 		{"drive", long, errFileNameTooLong, true},
 		{"no error", long, nil, false},
 		{"not found", long, errConfigNotFound, false},

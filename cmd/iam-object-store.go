@@ -135,10 +135,11 @@ func decryptData(data []byte, objPath string) ([]byte, error) {
 }
 
 // iamConfigNameTooLong reports whether the drives rejected objPath for its
-// length: an element over NAME_MAX (255) in checkPathLength, or ENAMETOOLONG
-// from a filesystem with a lower limit. IAM records are named after external
-// identities: a normalized LDAP DN hex-escapes every non-ASCII byte, so one
-// Cyrillic letter takes six characters. Such a record cannot have been stored.
+// length. IAM records are named after external identities: a normalized LDAP
+// DN hex-escapes every non-ASCII byte, so one Cyrillic letter takes six
+// characters. Such a record cannot have been stored. checkPathLength does not
+// count backslashes outside Windows, so an escaped DN can pass it and still
+// fail on the filesystem with ENAMETOOLONG once its parent directory exists.
 // toObjectErr reports both as ObjectNameInvalid, as it does for names that the
 // object layer rejects itself; repeat that validation to tell them apart.
 func iamConfigNameTooLong(objPath string, err error) bool {
